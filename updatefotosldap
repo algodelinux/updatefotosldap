@@ -1,0 +1,160 @@
+#!/usr/bin/perl
+#
+# Programa perl para subir y/o actualizar las fotos de los alumnos en servidor ldap del centro.
+# Toma como parámetro el fichero de exportación de datos de alumnado.
+# Actualiza las fotos de los alumnos en el servidor de ldap desde el fichero ExportacionDatosAlumnado.zip  
+# 
+#
+# Esteban M. Navas
+# IES Valle del Jerte
+# Fecha creación: 09/11/2010
+# Fecha última modificación: 29/04/2026
+
+# Requisito: Instalar los módulos de perl libnet-ldap-perl, 
+# libarchive-zip-perl y perlmagick
+
+# Bloque de instalación de dependencias
+BEGIN {
+    my %modulos = (
+        "Archive::Extract" => "libarchive-extract-perl",
+        "Net::LDAP"        => "libnet-ldap-perl",
+        "Image::Magick"    => "perlmagick",
+        "Archive::Zip"     => "libarchive-zip-perl"
+    );
+
+    my @faltan;
+    foreach my $modulo (keys %modulos) {
+        # Intentamos cargar el módulo en silencio
+        eval "require $modulo";
+        if ($@) {
+            push @faltan, $modulos{$modulo};
+        }
+    }
+
+    if (@faltan) {
+        print "📦 Instalando dependencias: @faltan...\n";
+        system("sudo apt-get update && sudo DEBIAN_FRONTEND=noninteractive apt-get install -y @faltan");
+        
+        if ($? == 0) {
+            print "✅ Instalación completada. Reiniciando script...\n";
+            exec($0, @ARGV); # Reinicia el script con los mismos argumentos
+        } else {
+            die "❌ Error: No se pudieron instalar las dependencias automáticamente.\n";
+        }
+    }
+}
+
+use Archive::Extract;
+use Net::LDAP;
+use Image::Magick;
+
+# Declaramos las funciones
+sub trim($);
+
+my $ldapserver = "servidor";
+my $archivo;
+
+if ($#ARGV != 0) {
+   print "Uso: updatefotosldap <Path Archivo Exportacion Datos Alumnado.zip>\n\n";
+   print "Ejemplo: updatefotosldap ExportacionDatosAlumnado.zip\n";
+   exit;
+} 
+
+if ( -e $ARGV[0] ) {
+   $archivo = $ARGV[0];
+}
+else {
+   print "El archivo $ARGV[0] no existe\n";
+   exit;
+}
+
+print "Descomprimiendo $archivo...\n";
+
+my $ae = Archive::Extract->new(archive => $archivo);
+my $ok = $ae->extract( to => '/tmp' ) or die $ae->error;
+my $outdir  = $ae->extract_path;
+my $files  = $ae->files;
+
+print "$archivo descomprimido en $outdir\n\n";
+
+print "Introduce la contraseña del administrador de ldap: ";
+system "stty -echo"; # disable echo
+chomp (my $pass = <STDIN>);
+system "stty echo"; # enable echo 
+
+$ldap = Net::LDAP->new("$ldapserver") or die "$@";
+
+# Abrimos una conexión
+$ldap->bind("cn=admin,ou=People,dc=instituto,dc=extremadura,dc=es", password=>$pass);
+
+# Obtenemos la lista de usuarios 
+$mesg = $ldap->search(filter=>"(&(objectClass=inetOrgPerson))", base=>"ou=People,dc=instituto,dc=extremadura,dc=es");
+@entries = $mesg->entries;
+
+# Procesamos cada usuario 
+foreach $entry (@entries) {
+   my $employeeNumber = $entry->get_value(employeeNumber);
+   my $cn = $entry->get_value(cn);
+
+   # Obtenemos el nombre del fichero
+   my $fichero = qx{ls $outdir | grep -iE '^$employeeNumber.[a-z]{3}'};
+
+   # Importante: Quitar los espacios que nos da la salida del qx{}
+   $fichero = trim($fichero);
+
+   # Si hay una foto para el alumno ...
+   if ( $fichero ) {
+      my $tmp; 
+      my $photo;
+
+      # Y si el alumno tiene foto en el servidor ldap...
+      if ( $entry->get_value( jpegPhoto ) ne '') {
+         # ...la borramos de allí
+         $mesg = $ldap->modify($entry->dn(), replace => {'jpegPhoto' => ''});
+      }
+
+      my $imagen = $outdir . "/" . $fichero;
+
+      # Cambiamos el tamaño y el formato de la imagen
+      my $nuevaimagen = Image::Magick->new;
+
+      $nuevaimagen->Read( filename => $imagen );
+      $nuevaimagen->Set( Gravity => 'Center' );
+      $nuevaimagen->Resize( geometry => '80x80' );
+      $nuevaimagen->Extent( geometry => '80x80' );
+
+      my $imagenretocada = $outdir . "/" . $employeeNumber . ".jpg";
+
+      $nuevaimagen->Write( "$imagenretocada" );
+
+      open(FILE, "$imagenretocada");
+      binmode(FILE);
+      $photo .= $tmp while (sysread FILE, $tmp, 1024); 
+      close(FILE);
+
+      $mesg = $ldap->modify($entry->dn(), replace => {'jpegPhoto'=>$photo});
+
+      print "Foto $imagenretocada de $cn actualizada.\n";
+	  
+      # Borramos la image retocada
+      unlink $imagenretocada;
+   }
+}
+
+# Cerramos la conexión
+$ldap->unbind;
+
+# Borramos los archivos extraidos en el directorio $outdir
+foreach $file (@$files) {
+    unlink "$outdir/$file";
+}
+
+print "Proceso concluido.\n\n";
+
+sub trim($) 
+{
+   my $string = shift;
+   $string =~ s/^\s+//;
+   $string =~ s/\s+$//;
+   return $string;
+}
